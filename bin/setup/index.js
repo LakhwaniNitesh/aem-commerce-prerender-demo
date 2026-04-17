@@ -7,6 +7,7 @@ import { createServerAdapter } from '@whatwg-node/server'
 import { createServer } from 'http'
 import { exec } from 'child_process'
 import { promisify } from 'util'
+import { fileURLToPath } from 'url'
 
 import { Files, State } from '@adobe/aio-sdk';
 import runtimeLib from '@adobe/aio-lib-runtime';
@@ -243,7 +244,7 @@ const RULES_MAP = {
     static serve(path) {
       try {
         const normalizedPath = path.replace(/^\//, '').replace(/^ui\//, '');
-        const filePath = join(import.meta.url.replace('file://', ''), '..', 'ui', normalizedPath);
+        const filePath = join(fileURLToPath(import.meta.url), '..', 'ui', normalizedPath);
         console.log("serving file", filePath);
         const content = readFileSync(filePath);
         const extension = path.substring(path.lastIndexOf('.'));
@@ -330,7 +331,10 @@ const RULES_MAP = {
           return RequestHelper.errorResponse('accessToken, org, and site are required');
         }
 
-        const apiKeyEndpoint = `https://admin.hlx.page/config/${org}/sites/${site}/apiKeys.json`;
+        const token = accessToken.trim();
+        const orgLower = org.toLowerCase();
+        const encodedSite = encodeURIComponent(site);
+        const apiKeyEndpoint = `https://admin.hlx.page/config/${orgLower}/sites/${encodedSite}/apiKeys.json`;
         const body = {
           description: `Key used by PDP Prerender components [${org}/${site}]`,
           roles: [
@@ -340,21 +344,92 @@ const RULES_MAP = {
 
         console.log(`Creating API key at ${apiKeyEndpoint}`);
 
-        const response = await fetch(apiKeyEndpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-auth-token': accessToken
+        const attempts = [
+          {
+            name: 'x-auth-token',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-auth-token': token
+            }
           },
-          body: JSON.stringify(body)
-        });
+          {
+            name: 'authorization-token',
+            headers: {
+              'Content-Type': 'application/json',
+              'authorization': `token ${token}`
+            }
+          },
+          {
+            name: 'authorization-bearer',
+            headers: {
+              'Content-Type': 'application/json',
+              'authorization': `Bearer ${token}`
+            }
+          },
+          {
+            name: 'cookie-auth_token',
+            headers: {
+              'Content-Type': 'application/json',
+              'cookie': `auth_token=${token}`
+            }
+          },
+          {
+            name: 'cookie-x-auth-token',
+            headers: {
+              'Content-Type': 'application/json',
+              'cookie': `x-auth-token=${token}`
+            }
+          }
+        ];
 
-        if (!response.ok) {
-          const errorText = await response.text();
-          return RequestHelper.errorResponse(`Failed to create API key: ${response.status} ${response.statusText} - ${errorText}`, response.status);
+        let lastError = {
+          status: 500,
+          statusText: 'Unknown Error',
+          body: '',
+          attempt: 'none',
+          xError: null,
+          xErrorCode: null
+        };
+
+        let result = null;
+
+        for (const attempt of attempts) {
+          const response = await fetch(apiKeyEndpoint, {
+            method: 'POST',
+            headers: attempt.headers,
+            body: JSON.stringify(body)
+          });
+
+          if (response.ok) {
+            result = await response.json();
+            break;
+          }
+
+          lastError = {
+            status: response.status,
+            statusText: response.statusText,
+            body: await response.text(),
+            attempt: attempt.name,
+            xError: response.headers.get('x-error'),
+            xErrorCode: response.headers.get('x-error-code')
+          };
+
+          if (![401, 403].includes(response.status)) {
+            break;
+          }
         }
 
-        const result = await response.json();
+        if (!result) {
+          return RequestHelper.jsonResponse({
+            error: `Failed to create API key: ${lastError.status} ${lastError.statusText}`,
+            details: {
+              authAttempt: lastError.attempt,
+              xError: lastError.xError,
+              xErrorCode: lastError.xErrorCode,
+              body: lastError.body
+            }
+          }, lastError.status || 500);
+        }
 
         return RequestHelper.jsonResponse({
           success: true,
@@ -365,6 +440,79 @@ const RULES_MAP = {
       } catch (error) {
         console.error('Error creating API key:', error);
         return RequestHelper.errorResponse('Failed to create API key: ' + error.message, 500);
+      }
+    }
+
+    static async fetchSites(request) {
+      try {
+        const { accessToken, org } = await request.json();
+
+        if (!accessToken || !org) {
+          return RequestHelper.errorResponse('accessToken and org are required');
+        }
+
+        const token = accessToken.trim();
+        const orgLower = org.toLowerCase();
+        const sitesEndpoint = `https://admin.hlx.page/config/${orgLower}/sites.json`;
+
+        const attempts = [
+          { name: 'x-auth-token', headers: { 'x-auth-token': token } },
+          { name: 'authorization-token', headers: { 'authorization': `token ${token}` } },
+          { name: 'authorization-bearer', headers: { 'authorization': `Bearer ${token}` } },
+          { name: 'cookie-auth_token', headers: { 'cookie': `auth_token=${token}` } },
+          { name: 'cookie-x-auth-token', headers: { 'cookie': `x-auth-token=${token}` } }
+        ];
+
+        let lastError = {
+          status: 500,
+          statusText: 'Unknown Error',
+          body: '',
+          attempt: 'none',
+          xError: null,
+          xErrorCode: null
+        };
+
+        for (const attempt of attempts) {
+          const response = await fetch(sitesEndpoint, {
+            method: 'GET',
+            headers: attempt.headers
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            return RequestHelper.jsonResponse({
+              success: true,
+              sites: data.sites || [],
+              authAttempt: attempt.name
+            });
+          }
+
+          lastError = {
+            status: response.status,
+            statusText: response.statusText,
+            body: await response.text(),
+            attempt: attempt.name,
+            xError: response.headers.get('x-error'),
+            xErrorCode: response.headers.get('x-error-code')
+          };
+
+          if (![401, 403].includes(response.status)) {
+            break;
+          }
+        }
+
+        return RequestHelper.jsonResponse({
+          error: `Failed to fetch sites: ${lastError.status} ${lastError.statusText}`,
+          details: {
+            authAttempt: lastError.attempt,
+            xError: lastError.xError,
+            xErrorCode: lastError.xErrorCode,
+            body: lastError.body
+          }
+        }, lastError.status || 500);
+      } catch (error) {
+        console.error('Error fetching sites:', error);
+        return RequestHelper.errorResponse('Failed to fetch sites: ' + error.message, 500);
       }
     }
 
@@ -581,27 +729,40 @@ const RULES_MAP = {
 
         // Execute aio app use command
         console.log(`Executing: aio app use "${newFileName}"`);
-        const { stdout, stderr } = await execAsync(`aio app use "${newFileName}" --no-input`, {
-          cwd: process.cwd(),
-          timeout: 30000,
-          stdio: 'pipe'
-        });
+        try {
+          const { stdout, stderr } = await execAsync(`aio app use "${newFileName}" --no-input`, {
+            cwd: process.cwd(),
+            timeout: 30000
+          });
 
-        if (stdout) {
-          console.log('AIO app use output:', stdout);
+          if (stdout) {
+            console.log('AIO app use output:', stdout);
+          }
+          if (stderr) {
+            console.log('AIO app use warnings:', stderr);
+          }
+
+          console.log('Successfully executed aio app use command.');
+
+          return RequestHelper.jsonResponse({
+            success: true,
+            applied: true,
+            message: 'AIO configuration saved and applied successfully.',
+            output: stdout,
+            warnings: stderr
+          });
+        } catch (applyError) {
+          // Keep this non-blocking: wizard can proceed with namespace/auth already extracted from the uploaded file.
+          console.warn('AIO configuration saved, but failed to run "aio app use":', applyError.message);
+          return RequestHelper.jsonResponse({
+            success: true,
+            applied: false,
+            message: 'AIO configuration saved. Could not run "aio app use" locally; continuing with uploaded credentials.',
+            warning: applyError.message,
+            stdout: applyError.stdout,
+            stderr: applyError.stderr
+          });
         }
-        if (stderr) {
-          console.log('AIO app use warnings:', stderr);
-        }
-
-        console.log('Successfully executed aio app use command.');
-
-        return RequestHelper.jsonResponse({
-          success: true,
-          message: 'AIO configuration saved and applied successfully.',
-          output: stdout,
-          warnings: stderr
-        });
 
       } catch (error) {
         console.error('Failed to execute aio app use command:', error.message);
@@ -765,6 +926,7 @@ class Server {
         .get('/api/files', ApiRoutes.getFiles)
         .get('/api/rules', ApiRoutes.getRules)
         .get('/api/git-info', ApiRoutes.getGitInfo)
+        .post('/api/fetch-sites', ApiRoutes.fetchSites)
         .post('/api/aio-config', ApiRoutes.aioConfig)
         .post('/api/create-api-key', ApiRoutes.createApiKey)
         .post('/api/external-submit', ApiRoutes.handleExternalSubmission)
