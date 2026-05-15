@@ -82,7 +82,11 @@ async function prepareBaseTemplate(url, blocks, context) {
    options = {headers:{'authorization': `token ${siteToken}`}}
   }
 
-  const baseTemplateHtml = await fetch(`${url}.plain.html`, {...options}).then(resp => resp.text());
+  const templateResp = await fetch(`${url}.plain.html`, {...options});
+  if (!templateResp.ok) {
+    throw new Error(`Failed to fetch products template at ${url}.plain.html: HTTP ${templateResp.status} ${templateResp.statusText}`);
+  }
+  const baseTemplateHtml = await templateResp.text();
 
   const $ = cheerio.load(`<main>${baseTemplateHtml}</main>`);
 
